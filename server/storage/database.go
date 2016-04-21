@@ -1,12 +1,14 @@
 package storage
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"time"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/go-sql-driver/mysql"
 	"github.com/jinzhu/gorm"
-	"github.com/mattn/go-sqlite3"
 )
 
 // SQLStorage implements a versioned store using a relational database.
@@ -37,12 +39,6 @@ func translateOldVersionError(err error) error {
 		if err.Number == 1022 || err.Number == 1062 {
 			return &ErrOldVersion{}
 		}
-	case *sqlite3.Error:
-		// https://godoc.org/github.com/mattn/go-sqlite3#pkg-variables
-		if err.Code == sqlite3.ErrConstraint &&
-			err.ExtendedCode == sqlite3.ErrConstraintUnique {
-			return &ErrOldVersion{}
-		}
 	}
 	return err
 }
@@ -58,11 +54,12 @@ func (db *SQLStorage) UpdateCurrent(gun string, update MetaUpdate) error {
 	if !exists.RecordNotFound() {
 		return &ErrOldVersion{}
 	}
-
+	checksum := sha256.Sum256(update.Data)
 	return translateOldVersionError(db.Create(&TUFFile{
 		Gun:     gun,
 		Role:    update.Role,
 		Version: update.Version,
+		Sha256:  hex.EncodeToString(checksum[:]),
 		Data:    update.Data,
 	}).Error)
 }
@@ -99,11 +96,13 @@ func (db *SQLStorage) UpdateMany(gun string, updates []MetaUpdate) error {
 		}
 
 		var row TUFFile
+		checksum := sha256.Sum256(update.Data)
+		hexChecksum := hex.EncodeToString(checksum[:])
 		query = tx.Where(map[string]interface{}{
 			"gun":     gun,
 			"role":    update.Role,
 			"version": update.Version,
-		}).Attrs("data", update.Data).FirstOrCreate(&row)
+		}).Attrs("data", update.Data).Attrs("sha256", hexChecksum).FirstOrCreate(&row)
 
 		if query.Error != nil {
 			return rollback(translateOldVersionError(query.Error))
@@ -119,16 +118,39 @@ func (db *SQLStorage) UpdateMany(gun string, updates []MetaUpdate) error {
 }
 
 // GetCurrent gets a specific TUF record
-func (db *SQLStorage) GetCurrent(gun, tufRole string) ([]byte, error) {
+func (db *SQLStorage) GetCurrent(gun, tufRole string) (*time.Time, []byte, error) {
 	var row TUFFile
-	q := db.Select("data").Where(&TUFFile{Gun: gun, Role: tufRole}).Order("version desc").Limit(1).First(&row)
-
-	if q.RecordNotFound() {
-		return nil, ErrNotFound{}
-	} else if q.Error != nil {
-		return nil, q.Error
+	q := db.Select("updated_at, data").Where(
+		&TUFFile{Gun: gun, Role: tufRole}).Order("version desc").Limit(1).First(&row)
+	if err := isReadErr(q, row); err != nil {
+		return nil, nil, err
 	}
-	return row.Data, nil
+	return &(row.UpdatedAt), row.Data, nil
+}
+
+// GetChecksum gets a specific TUF record by its hex checksum
+func (db *SQLStorage) GetChecksum(gun, tufRole, checksum string) (*time.Time, []byte, error) {
+	var row TUFFile
+	q := db.Select("created_at, data").Where(
+		&TUFFile{
+			Gun:    gun,
+			Role:   tufRole,
+			Sha256: checksum,
+		},
+	).First(&row)
+	if err := isReadErr(q, row); err != nil {
+		return nil, nil, err
+	}
+	return &(row.CreatedAt), row.Data, nil
+}
+
+func isReadErr(q *gorm.DB, row TUFFile) error {
+	if q.RecordNotFound() {
+		return ErrNotFound{}
+	} else if q.Error != nil {
+		return q.Error
+	}
+	return nil
 }
 
 // Delete deletes all the records for a specific GUN

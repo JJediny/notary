@@ -5,169 +5,133 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jfrazelle/go/canonical/json"
-	"github.com/stretchr/testify/assert"
+	"github.com/docker/go/canonical/json"
+	"github.com/stretchr/testify/require"
 
 	"github.com/docker/notary/tuf/data"
-	"github.com/docker/notary/tuf/keys"
 )
 
 func TestRoleNoKeys(t *testing.T) {
 	cs := NewEd25519()
-	k, err := cs.Create("root", data.ED25519Key)
-	assert.NoError(t, err)
-	r, err := data.NewRole(
-		"root",
-		1,
-		[]string{},
-		nil,
-		nil,
-	)
-	assert.NoError(t, err)
-	db := keys.NewDB()
-	assert.NoError(t, err)
-	err = db.AddRole(r)
-	assert.NoError(t, err)
+	k, err := cs.Create("root", "", data.ED25519Key)
+	require.NoError(t, err)
+	require.NoError(t, err)
+	roleWithKeys := data.BaseRole{Name: "root", Keys: data.Keys{}, Threshold: 1}
+
 	meta := &data.SignedCommon{Type: "Root", Version: 1, Expires: data.DefaultExpires("root")}
 
 	b, err := json.MarshalCanonical(meta)
-	assert.NoError(t, err)
-	s := &data.Signed{Signed: b}
-	Sign(cs, s, k)
-	err = Verify(s, "root", 1, db)
-	assert.IsType(t, ErrRoleThreshold{}, err)
+	require.NoError(t, err)
+	s := &data.Signed{Signed: (*json.RawMessage)(&b)}
+	Sign(cs, s, []data.PublicKey{k}, 1, nil)
+	err = Verify(s, roleWithKeys, 1)
+	require.IsType(t, ErrRoleThreshold{}, err)
 }
 
 func TestNotEnoughSigs(t *testing.T) {
 	cs := NewEd25519()
-	k, err := cs.Create("root", data.ED25519Key)
-	assert.NoError(t, err)
-	r, err := data.NewRole(
-		"root",
-		2,
-		[]string{k.ID()},
-		nil,
-		nil,
-	)
-	assert.NoError(t, err)
-	db := keys.NewDB()
-	assert.NoError(t, err)
-	db.AddKey(k)
-	err = db.AddRole(r)
-	assert.NoError(t, err)
+	k, err := cs.Create("root", "", data.ED25519Key)
+	require.NoError(t, err)
+	require.NoError(t, err)
+	roleWithKeys := data.BaseRole{Name: "root", Keys: data.Keys{k.ID(): k}, Threshold: 2}
+
 	meta := &data.SignedCommon{Type: "Root", Version: 1, Expires: data.DefaultExpires("root")}
 
 	b, err := json.MarshalCanonical(meta)
-	assert.NoError(t, err)
-	s := &data.Signed{Signed: b}
-	Sign(cs, s, k)
-	err = Verify(s, "root", 1, db)
-	assert.IsType(t, ErrRoleThreshold{}, err)
+	require.NoError(t, err)
+	s := &data.Signed{Signed: (*json.RawMessage)(&b)}
+	Sign(cs, s, []data.PublicKey{k}, 1, nil)
+	err = Verify(s, roleWithKeys, 1)
+	require.IsType(t, ErrRoleThreshold{}, err)
 }
 
 func TestMoreThanEnoughSigs(t *testing.T) {
 	cs := NewEd25519()
-	k1, err := cs.Create("root", data.ED25519Key)
-	assert.NoError(t, err)
-	k2, err := cs.Create("root", data.ED25519Key)
-	assert.NoError(t, err)
-	r, err := data.NewRole(
-		"root",
-		1,
-		[]string{k1.ID(), k2.ID()},
-		nil,
-		nil,
-	)
-	assert.NoError(t, err)
-	db := keys.NewDB()
-	assert.NoError(t, err)
-	db.AddKey(k1)
-	db.AddKey(k2)
-	err = db.AddRole(r)
-	assert.NoError(t, err)
+	k1, err := cs.Create("root", "", data.ED25519Key)
+	require.NoError(t, err)
+	k2, err := cs.Create("root", "", data.ED25519Key)
+	require.NoError(t, err)
+	roleWithKeys := data.BaseRole{Name: "root", Keys: data.Keys{k1.ID(): k1, k2.ID(): k2}, Threshold: 1}
+
 	meta := &data.SignedCommon{Type: "Root", Version: 1, Expires: data.DefaultExpires("root")}
 
 	b, err := json.MarshalCanonical(meta)
-	assert.NoError(t, err)
-	s := &data.Signed{Signed: b}
-	Sign(cs, s, k1, k2)
-	assert.Equal(t, 2, len(s.Signatures))
-	err = Verify(s, "root", 1, db)
-	assert.NoError(t, err)
+	require.NoError(t, err)
+	s := &data.Signed{Signed: (*json.RawMessage)(&b)}
+	Sign(cs, s, []data.PublicKey{k1, k2}, 2, nil)
+	require.Equal(t, 2, len(s.Signatures))
+
+	err = Verify(s, roleWithKeys, 1)
+	require.NoError(t, err)
+}
+
+func TestValidSigWithIncorrectKeyID(t *testing.T) {
+	cs := NewEd25519()
+	k1, err := cs.Create("root", "", data.ED25519Key)
+	require.NoError(t, err)
+	roleWithKeys := data.BaseRole{Name: "root", Keys: data.Keys{"invalidIDA": k1}, Threshold: 1}
+
+	meta := &data.SignedCommon{Type: "Root", Version: 1, Expires: data.DefaultExpires("root")}
+
+	b, err := json.MarshalCanonical(meta)
+	require.NoError(t, err)
+	s := &data.Signed{Signed: (*json.RawMessage)(&b)}
+	Sign(cs, s, []data.PublicKey{k1}, 1, nil)
+	require.Equal(t, 1, len(s.Signatures))
+	s.Signatures[0].KeyID = "invalidIDA"
+	err = Verify(s, roleWithKeys, 1)
+	require.Error(t, err)
+	require.IsType(t, ErrInvalidKeyID{}, err)
 }
 
 func TestDuplicateSigs(t *testing.T) {
 	cs := NewEd25519()
-	k, err := cs.Create("root", data.ED25519Key)
-	assert.NoError(t, err)
-	r, err := data.NewRole(
-		"root",
-		2,
-		[]string{k.ID()},
-		nil,
-		nil,
-	)
-	assert.NoError(t, err)
-	db := keys.NewDB()
-	assert.NoError(t, err)
-	db.AddKey(k)
-	err = db.AddRole(r)
-	assert.NoError(t, err)
+	k, err := cs.Create("root", "", data.ED25519Key)
+	require.NoError(t, err)
+	roleWithKeys := data.BaseRole{Name: "root", Keys: data.Keys{k.ID(): k}, Threshold: 2}
+
 	meta := &data.SignedCommon{Type: "Root", Version: 1, Expires: data.DefaultExpires("root")}
 
 	b, err := json.MarshalCanonical(meta)
-	assert.NoError(t, err)
-	s := &data.Signed{Signed: b}
-	Sign(cs, s, k)
+	require.NoError(t, err)
+	s := &data.Signed{Signed: (*json.RawMessage)(&b)}
+	Sign(cs, s, []data.PublicKey{k}, 1, nil)
 	s.Signatures = append(s.Signatures, s.Signatures[0])
-	err = Verify(s, "root", 1, db)
-	assert.IsType(t, ErrRoleThreshold{}, err)
+	err = Verify(s, roleWithKeys, 1)
+	require.IsType(t, ErrRoleThreshold{}, err)
 }
 
 func TestUnknownKeyBelowThreshold(t *testing.T) {
 	cs := NewEd25519()
-	k, err := cs.Create("root", data.ED25519Key)
-	assert.NoError(t, err)
-	unknown, err := cs.Create("root", data.ED25519Key)
-	assert.NoError(t, err)
-	r, err := data.NewRole(
-		"root",
-		2,
-		[]string{k.ID()},
-		nil,
-		nil,
-	)
-	assert.NoError(t, err)
-	db := keys.NewDB()
-	assert.NoError(t, err)
-	db.AddKey(k)
-	db.AddKey(unknown)
-	err = db.AddRole(r)
-	assert.NoError(t, err)
+	k, err := cs.Create("root", "", data.ED25519Key)
+	require.NoError(t, err)
+	unknown, err := cs.Create("root", "", data.ED25519Key)
+	require.NoError(t, err)
+	roleWithKeys := data.BaseRole{Name: "root", Keys: data.Keys{k.ID(): k}, Threshold: 2}
+
 	meta := &data.SignedCommon{Type: "Root", Version: 1, Expires: data.DefaultExpires("root")}
 
 	b, err := json.MarshalCanonical(meta)
-	assert.NoError(t, err)
-	s := &data.Signed{Signed: b}
-	Sign(cs, s, k, unknown)
+	require.NoError(t, err)
+	s := &data.Signed{Signed: (*json.RawMessage)(&b)}
+	Sign(cs, s, []data.PublicKey{k, unknown}, 2, nil)
 	s.Signatures = append(s.Signatures)
-	err = Verify(s, "root", 1, db)
-	assert.IsType(t, ErrRoleThreshold{}, err)
+	err = Verify(s, roleWithKeys, 1)
+	require.IsType(t, ErrRoleThreshold{}, err)
 }
 
 func Test(t *testing.T) {
 	cryptoService := NewEd25519()
 	type test struct {
-		name  string
-		keys  []data.PublicKey
-		roles map[string]*data.Role
-		s     *data.Signed
-		ver   int
-		exp   *time.Time
-		typ   string
-		role  string
-		err   error
-		mut   func(*test)
+		name     string
+		roleData data.BaseRole
+		s        *data.Signed
+		ver      int
+		exp      *time.Time
+		typ      string
+		role     string
+		err      error
+		mut      func(*test)
 	}
 
 	expiredTime := time.Now().Add(-time.Hour)
@@ -204,7 +168,6 @@ func Test(t *testing.T) {
 		},
 	}
 	for _, run := range tests {
-		db := keys.NewDB()
 		if run.role == "" {
 			run.role = "root"
 		}
@@ -218,43 +181,34 @@ func Test(t *testing.T) {
 		if run.typ == "" {
 			run.typ = data.TUFTypes[run.role]
 		}
-		if run.keys == nil && run.s == nil {
-			k, _ := cryptoService.Create("root", data.ED25519Key)
-			db.AddKey(k)
-			r, err := data.NewRole(
-				"root",
-				1,
-				[]string{k.ID()},
-				nil,
-				nil,
-			)
-			assert.NoError(t, err)
-			db.AddRole(r)
+		if run.s == nil {
+			k, _ := cryptoService.Create("root", "", data.ED25519Key)
+			run.roleData = data.BaseRole{Name: "root", Keys: data.Keys{k.ID(): k}, Threshold: 1}
 			meta := &data.SignedCommon{Type: run.typ, Version: run.ver, Expires: *run.exp}
 
 			b, err := json.MarshalCanonical(meta)
-			assert.NoError(t, err)
-			s := &data.Signed{Signed: b}
-			Sign(cryptoService, s, k)
+			require.NoError(t, err)
+			s := &data.Signed{Signed: (*json.RawMessage)(&b)}
+			Sign(cryptoService, s, []data.PublicKey{k}, 1, nil)
 			run.s = s
 		}
 		if run.mut != nil {
 			run.mut(&run)
 		}
 
-		err := Verify(run.s, run.role, minVer, db)
+		err := Verify(run.s, run.roleData, minVer)
 		if e, ok := run.err.(ErrExpired); ok {
-			assertErrExpired(t, err, e)
+			requireErrExpired(t, err, e)
 		} else {
-			assert.Equal(t, run.err, err)
+			require.Equal(t, run.err, err)
 		}
 	}
 }
 
-func assertErrExpired(t *testing.T, err error, expected ErrExpired) {
+func requireErrExpired(t *testing.T, err error, expected ErrExpired) {
 	actual, ok := err.(ErrExpired)
 	if !ok {
 		t.Fatalf("expected err to have type ErrExpired, got %T", err)
 	}
-	assert.Equal(t, actual.Expired, expected.Expired)
+	require.Equal(t, actual.Expired, expected.Expired)
 }

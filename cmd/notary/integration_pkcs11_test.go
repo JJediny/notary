@@ -8,41 +8,49 @@ import (
 	"github.com/docker/notary/passphrase"
 	"github.com/docker/notary/trustmanager/yubikey"
 	"github.com/docker/notary/tuf/data"
-	"github.com/stretchr/testify/assert"
+	"github.com/spf13/cobra"
+	"github.com/stretchr/testify/require"
 )
 
-var rootOnHardware = yubikey.YubikeyAccessible
+var _retriever passphrase.Retriever
 
-// Per-test set up that returns a cleanup function.  This set up:
-// - changes the passphrase retriever to always produce a constant passphrase
-// - disables touch on yubikeys
-// - deletes all keys on the yubikey
-func setUp(t *testing.T) func() {
-	oldRetriever := retriever
+func init() {
+	yubikey.SetYubikeyKeyMode(yubikey.KeymodeNone)
 
-	var fake = func(k, a string, c bool, n int) (string, bool, error) {
+	regRetriver := passphrase.PromptRetriever()
+	_retriever := func(k, a string, c bool, n int) (string, bool, error) {
 		if k == "Yubikey" {
-			return oldRetriever(k, a, c, n)
+			return regRetriver(k, a, c, n)
 		}
 		return testPassphrase, false, nil
 	}
 
-	retriever = fake
-	getRetriever = func() passphrase.Retriever { return fake }
-	yubikey.SetYubikeyKeyMode(yubikey.KeymodeNone)
-
-	// //we're just removing keys here, so nil is fine
-	s, err := yubikey.NewYubiKeyStore(nil, retriever)
-	assert.NoError(t, err)
-	for k := range s.ListKeys() {
-		err := s.RemoveKey(k)
-		assert.NoError(t, err)
+	// best effort at removing keys here, so nil is fine
+	s, err := yubikey.NewYubiStore(nil, _retriever)
+	if err != nil {
+		for k := range s.ListKeys() {
+			s.RemoveKey(k)
+		}
 	}
 
-	return func() {
-		retriever = oldRetriever
-		getRetriever = getPassphraseRetriever
-		yubikey.SetYubikeyKeyMode(yubikey.KeymodeTouch | yubikey.KeymodePinOnce)
+	NewNotaryCommand = func() *cobra.Command {
+		commander := &notaryCommander{
+			getRetriever: func() passphrase.Retriever { return _retriever },
+		}
+		return commander.GetCommand()
+	}
+}
+
+var rootOnHardware = yubikey.IsAccessible
+
+// Per-test set up deletes all keys on the yubikey
+func setUp(t *testing.T) {
+	//we're just removing keys here, so nil is fine
+	s, err := yubikey.NewYubiStore(nil, _retriever)
+	require.NoError(t, err)
+	for k := range s.ListKeys() {
+		err := s.RemoveKey(k)
+		require.NoError(t, err)
 	}
 }
 
@@ -51,13 +59,13 @@ func setUp(t *testing.T) func() {
 // on disk
 func verifyRootKeyOnHardware(t *testing.T, rootKeyID string) {
 	// do not bother verifying if there is no yubikey available
-	if yubikey.YubikeyAccessible() {
+	if yubikey.IsAccessible() {
 		// //we're just getting keys here, so nil is fine
-		s, err := yubikey.NewYubiKeyStore(nil, retriever)
-		assert.NoError(t, err)
+		s, err := yubikey.NewYubiStore(nil, _retriever)
+		require.NoError(t, err)
 		privKey, role, err := s.GetKey(rootKeyID)
-		assert.NoError(t, err)
-		assert.NotNil(t, privKey)
-		assert.Equal(t, data.CanonicalRootRole, role)
+		require.NoError(t, err)
+		require.NotNil(t, privKey)
+		require.Equal(t, data.CanonicalRootRole, role)
 	}
 }

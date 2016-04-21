@@ -1,9 +1,12 @@
 package storage
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 )
 
 type key struct {
@@ -12,23 +15,26 @@ type key struct {
 }
 
 type ver struct {
-	version int
-	data    []byte
+	version      int
+	data         []byte
+	createupdate time.Time
 }
 
 // MemStorage is really just designed for dev and testing. It is very
 // inefficient in many scenarios
 type MemStorage struct {
-	lock    sync.Mutex
-	tufMeta map[string][]*ver
-	keys    map[string]map[string]*key
+	lock      sync.Mutex
+	tufMeta   map[string][]*ver
+	keys      map[string]map[string]*key
+	checksums map[string]map[string]ver
 }
 
 // NewMemStorage instantiates a memStorage instance
 func NewMemStorage() *MemStorage {
 	return &MemStorage{
-		tufMeta: make(map[string][]*ver),
-		keys:    make(map[string]map[string]*key),
+		tufMeta:   make(map[string][]*ver),
+		keys:      make(map[string]map[string]*key),
+		checksums: make(map[string]map[string]ver),
 	}
 }
 
@@ -44,31 +50,53 @@ func (st *MemStorage) UpdateCurrent(gun string, update MetaUpdate) error {
 			}
 		}
 	}
-	st.tufMeta[id] = append(st.tufMeta[id], &ver{version: update.Version, data: update.Data})
+	version := ver{version: update.Version, data: update.Data, createupdate: time.Now()}
+	st.tufMeta[id] = append(st.tufMeta[id], &version)
+	checksumBytes := sha256.Sum256(update.Data)
+	checksum := hex.EncodeToString(checksumBytes[:])
+
+	_, ok := st.checksums[gun]
+	if !ok {
+		st.checksums[gun] = make(map[string]ver)
+	}
+	st.checksums[gun][checksum] = version
 	return nil
 }
 
 // UpdateMany updates multiple TUF records
 func (st *MemStorage) UpdateMany(gun string, updates []MetaUpdate) error {
 	for _, u := range updates {
-		st.UpdateCurrent(gun, u)
+		if err := st.UpdateCurrent(gun, u); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// GetCurrent returns the metadada for a given role, under a GUN
-func (st *MemStorage) GetCurrent(gun, role string) (data []byte, err error) {
+// GetCurrent returns the createupdate date metadata for a given role, under a GUN.
+func (st *MemStorage) GetCurrent(gun, role string) (*time.Time, []byte, error) {
 	id := entryKey(gun, role)
 	st.lock.Lock()
 	defer st.lock.Unlock()
 	space, ok := st.tufMeta[id]
 	if !ok || len(space) == 0 {
-		return nil, ErrNotFound{}
+		return nil, nil, ErrNotFound{}
 	}
-	return space[len(space)-1].data, nil
+	return &(space[len(space)-1].createupdate), space[len(space)-1].data, nil
 }
 
-// Delete delets all the metadata for a given GUN
+// GetChecksum returns the createupdate date and metadata for a given role, under a GUN.
+func (st *MemStorage) GetChecksum(gun, role, checksum string) (*time.Time, []byte, error) {
+	st.lock.Lock()
+	defer st.lock.Unlock()
+	space, ok := st.checksums[gun][checksum]
+	if !ok || len(space.data) == 0 {
+		return nil, nil, ErrNotFound{}
+	}
+	return &(space.createupdate), space.data, nil
+}
+
+// Delete deletes all the metadata for a given GUN
 func (st *MemStorage) Delete(gun string) error {
 	st.lock.Lock()
 	defer st.lock.Unlock()
@@ -77,6 +105,7 @@ func (st *MemStorage) Delete(gun string) error {
 			delete(st.tufMeta, k)
 		}
 	}
+	delete(st.checksums, gun)
 	return nil
 }
 

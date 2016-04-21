@@ -23,6 +23,7 @@ import (
 	"path"
 
 	"github.com/Sirupsen/logrus"
+	"github.com/docker/notary"
 	"github.com/docker/notary/tuf/validation"
 )
 
@@ -33,7 +34,10 @@ type ErrServerUnavailable struct {
 }
 
 func (err ErrServerUnavailable) Error() string {
-	return fmt.Sprintf("Unable to reach trust server at this time: %d.", err.code)
+	if err.code == 401 {
+		return fmt.Sprintf("you are not authorized to perform this operation: server returned 401.")
+	}
+	return fmt.Sprintf("unable to reach trust server at this time: %d.", err.code)
 }
 
 // ErrMaliciousServer indicates the server returned a response that is highly suspected
@@ -42,7 +46,7 @@ func (err ErrServerUnavailable) Error() string {
 type ErrMaliciousServer struct{}
 
 func (err ErrMaliciousServer) Error() string {
-	return "Trust server returned a bad response."
+	return "trust server returned a bad response."
 }
 
 // ErrInvalidOperation indicates that the server returned a 400 response and
@@ -53,9 +57,9 @@ type ErrInvalidOperation struct {
 
 func (err ErrInvalidOperation) Error() string {
 	if err.msg != "" {
-		return fmt.Sprintf("Trust server rejected operation: %s", err.msg)
+		return fmt.Sprintf("trust server rejected operation: %s", err.msg)
 	}
-	return "Trust server rejected operation."
+	return "trust server rejected operation."
 }
 
 // HTTPStore manages pulling and pushing metadata from and to a remote
@@ -71,13 +75,12 @@ type HTTPStore struct {
 	baseURL       url.URL
 	metaPrefix    string
 	metaExtension string
-	targetsPrefix string
 	keyExtension  string
 	roundTrip     http.RoundTripper
 }
 
 // NewHTTPStore initializes a new store against a URL and a number of configuration options
-func NewHTTPStore(baseURL, metaPrefix, metaExtension, targetsPrefix, keyExtension string, roundTrip http.RoundTripper) (RemoteStore, error) {
+func NewHTTPStore(baseURL, metaPrefix, metaExtension, keyExtension string, roundTrip http.RoundTripper) (RemoteStore, error) {
 	base, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, err
@@ -85,11 +88,13 @@ func NewHTTPStore(baseURL, metaPrefix, metaExtension, targetsPrefix, keyExtensio
 	if !base.IsAbs() {
 		return nil, errors.New("HTTPStore requires an absolute baseURL")
 	}
+	if roundTrip == nil {
+		return &OfflineStore{}, nil
+	}
 	return &HTTPStore{
 		baseURL:       *base,
 		metaPrefix:    metaPrefix,
 		metaExtension: metaExtension,
-		targetsPrefix: targetsPrefix,
 		keyExtension:  keyExtension,
 		roundTrip:     roundTrip,
 	}, nil
@@ -118,12 +123,12 @@ func tryUnmarshalError(resp *http.Response, defaultError error) error {
 	return err
 }
 
-func translateStatusToError(resp *http.Response) error {
+func translateStatusToError(resp *http.Response, resource string) error {
 	switch resp.StatusCode {
 	case http.StatusOK:
 		return nil
 	case http.StatusNotFound:
-		return ErrMetaNotFound{}
+		return ErrMetaNotFound{Resource: resource}
 	case http.StatusBadRequest:
 		return tryUnmarshalError(resp, ErrInvalidOperation{})
 	default:
@@ -134,6 +139,7 @@ func translateStatusToError(resp *http.Response) error {
 // GetMeta downloads the named meta file with the given size. A short body
 // is acceptable because in the case of timestamp.json, the size is a cap,
 // not an exact length.
+// If size is -1, this corresponds to "infinite," but we cut off at 100MB
 func (s HTTPStore) GetMeta(name string, size int64) ([]byte, error) {
 	url, err := s.buildMetaURL(name)
 	if err != nil {
@@ -148,9 +154,12 @@ func (s HTTPStore) GetMeta(name string, size int64) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if err := translateStatusToError(resp); err != nil {
+	if err := translateStatusToError(resp, name); err != nil {
 		logrus.Debugf("received HTTP status %d when requesting %s.", resp.StatusCode, name)
 		return nil, err
+	}
+	if size == -1 {
+		size = notary.MaxDownloadSize
 	}
 	if resp.ContentLength > size {
 		return nil, ErrMaliciousServer{}
@@ -179,7 +188,13 @@ func (s HTTPStore) SetMeta(name string, blob []byte) error {
 		return err
 	}
 	defer resp.Body.Close()
-	return translateStatusToError(resp)
+	return translateStatusToError(resp, "POST "+name)
+}
+
+// RemoveMeta always fails, because we should never be able to delete metadata
+// remotely
+func (s HTTPStore) RemoveMeta(name string) error {
+	return ErrInvalidOperation{msg: "cannot delete metadata"}
 }
 
 // NewMultiPartMetaRequest builds a request with the provided metadata updates
@@ -223,7 +238,13 @@ func (s HTTPStore) SetMultiMeta(metas map[string][]byte) error {
 		return err
 	}
 	defer resp.Body.Close()
-	return translateStatusToError(resp)
+	// if this 404's something is pretty wrong
+	return translateStatusToError(resp, "POST metadata endpoint")
+}
+
+// RemoveAll in the interface is not supported, admins should use the DeleteHandler endpoint directly to delete remote data for a GUN
+func (s HTTPStore) RemoveAll() error {
+	return errors.New("remove all functionality not supported for HTTPStore")
 }
 
 func (s HTTPStore) buildMetaURL(name string) (*url.URL, error) {
@@ -232,11 +253,6 @@ func (s HTTPStore) buildMetaURL(name string) (*url.URL, error) {
 		filename = fmt.Sprintf("%s.%s", name, s.metaExtension)
 	}
 	uri := path.Join(s.metaPrefix, filename)
-	return s.buildURL(uri)
-}
-
-func (s HTTPStore) buildTargetsURL(name string) (*url.URL, error) {
-	uri := path.Join(s.targetsPrefix, name)
 	return s.buildURL(uri)
 }
 
@@ -254,29 +270,6 @@ func (s HTTPStore) buildURL(uri string) (*url.URL, error) {
 	return s.baseURL.ResolveReference(sub), nil
 }
 
-// GetTarget returns a reader for the desired target or an error.
-// N.B. The caller is responsible for closing the reader.
-func (s HTTPStore) GetTarget(path string) (io.ReadCloser, error) {
-	url, err := s.buildTargetsURL(path)
-	if err != nil {
-		return nil, err
-	}
-	logrus.Debug("Attempting to download target: ", url.String())
-	req, err := http.NewRequest("GET", url.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	resp, err := s.roundTrip.RoundTrip(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if err := translateStatusToError(resp); err != nil {
-		return nil, err
-	}
-	return resp.Body, nil
-}
-
 // GetKey retrieves a public key from the remote server
 func (s HTTPStore) GetKey(role string) ([]byte, error) {
 	url, err := s.buildKeyURL(role)
@@ -292,7 +285,7 @@ func (s HTTPStore) GetKey(role string) ([]byte, error) {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if err := translateStatusToError(resp); err != nil {
+	if err := translateStatusToError(resp, role+" key"); err != nil {
 		return nil, err
 	}
 	body, err := ioutil.ReadAll(resp.Body)

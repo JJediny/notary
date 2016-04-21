@@ -1,11 +1,13 @@
 package snapshot
 
 import (
-	"encoding/json"
+	"time"
 
 	"github.com/Sirupsen/logrus"
 
+	"github.com/docker/go/canonical/json"
 	"github.com/docker/notary/server/storage"
+	"github.com/docker/notary/tuf"
 	"github.com/docker/notary/tuf/data"
 	"github.com/docker/notary/tuf/signed"
 )
@@ -20,7 +22,7 @@ func GetOrCreateSnapshotKey(gun string, store storage.KeyStore, crypto signed.Cr
 	}
 
 	if _, ok := err.(*storage.ErrNoKey); ok {
-		key, err := crypto.Create("snapshot", createAlgorithm)
+		key, err := crypto.Create(data.CanonicalSnapshotRole, gun, createAlgorithm)
 		if err != nil {
 			return nil, err
 		}
@@ -42,44 +44,50 @@ func GetOrCreateSnapshotKey(gun string, store storage.KeyStore, crypto signed.Cr
 	return nil, err
 }
 
-// GetOrCreateSnapshot either returns the exisiting latest snapshot, or uses
-// whatever the most recent snapshot is to create the next one, only updating
-// the expiry time and version.
-func GetOrCreateSnapshot(gun string, store storage.MetaStore, cryptoService signed.CryptoService) ([]byte, error) {
+// GetOrCreateSnapshot either returns the existing latest snapshot, or uses
+// whatever the most recent snapshot is to generate the next one, only updating
+// the expiry time and version.  Note that this function does not write generated
+// snapshots to the underlying data store, and will either return the latest snapshot time
+// or nil as the time modified
+func GetOrCreateSnapshot(gun, checksum string, store storage.MetaStore, cryptoService signed.CryptoService) (
+	*time.Time, []byte, error) {
 
-	d, err := store.GetCurrent(gun, "snapshot")
+	lastModified, currentJSON, err := store.GetChecksum(gun, data.CanonicalSnapshotRole, checksum)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	sn := &data.SignedSnapshot{}
-	if d != nil {
-		err := json.Unmarshal(d, sn)
-		if err != nil {
-			logrus.Error("Failed to unmarshal existing snapshot")
-			return nil, err
-		}
-
-		if !snapshotExpired(sn) {
-			return d, nil
-		}
+	prev := new(data.SignedSnapshot)
+	if err := json.Unmarshal(currentJSON, prev); err != nil {
+		logrus.Error("Failed to unmarshal existing snapshot for GUN ", gun)
+		return nil, nil, err
 	}
 
-	sgnd, version, err := createSnapshot(gun, sn, store, cryptoService)
+	if !snapshotExpired(prev) {
+		return lastModified, currentJSON, nil
+	}
+
+	repo := tuf.NewRepo(cryptoService)
+
+	// load the current root to ensure we use the correct snapshot key.
+	_, rootJSON, err := store.GetCurrent(gun, data.CanonicalRootRole)
+
+	if err != nil {
+		return nil, nil, err
+	}
+	root := &data.SignedRoot{}
+	if err := json.Unmarshal(rootJSON, root); err != nil {
+		logrus.Error("Failed to unmarshal existing root for GUN ", gun)
+		return nil, nil, err
+	}
+	repo.SetRoot(root)
+
+	snapshotUpdate, err := NewSnapshotUpdate(prev, repo)
 	if err != nil {
 		logrus.Error("Failed to create a new snapshot")
-		return nil, err
+		return nil, nil, err
 	}
-	out, err := json.Marshal(sgnd)
-	if err != nil {
-		logrus.Error("Failed to marshal new snapshot")
-		return nil, err
-	}
-	err = store.UpdateCurrent(gun, storage.MetaUpdate{Role: "snapshot", Version: version, Data: out})
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
+	return nil, snapshotUpdate.Data, nil
 }
 
 // snapshotExpired simply checks if the snapshot is past its expiry time
@@ -87,33 +95,28 @@ func snapshotExpired(sn *data.SignedSnapshot) bool {
 	return signed.IsExpired(sn.Signed.Expires)
 }
 
-// createSnapshot uses an existing snapshot to create a new one.
-// Important things to be aware of:
-//   - It requires that a snapshot already exists. We create snapshots
-//     on upload so there should always be an existing snapshot if this
-//     gets called.
-//   - It doesn't update what roles are present in the snapshot, as those
-//     were validated during upload.
-func createSnapshot(gun string, sn *data.SignedSnapshot, store storage.MetaStore, cryptoService signed.CryptoService) (*data.Signed, int, error) {
-	algorithm, public, err := store.GetKey(gun, data.CanonicalSnapshotRole)
-	if err != nil {
-		// owner of gun must have generated a snapshot key otherwise
-		// we won't proceed with generating everything.
-		return nil, 0, err
+// NewSnapshotUpdate produces a new snapshot and returns it as a metadata update, given the
+// previous snapshot and the TUF repo.
+func NewSnapshotUpdate(prev *data.SignedSnapshot, repo *tuf.Repo) (*storage.MetaUpdate, error) {
+	if prev != nil {
+		repo.SetSnapshot(prev) // SetSnapshot never errors
+	} else {
+		// this will only occur if no snapshot has ever been created for the repository
+		if err := repo.InitSnapshot(); err != nil {
+			return nil, err
+		}
 	}
-	key := data.NewPublicKey(algorithm, public)
-
-	// update version and expiry
-	sn.Signed.Version = sn.Signed.Version + 1
-	sn.Signed.Expires = data.DefaultExpires(data.CanonicalSnapshotRole)
-
-	out, err := sn.ToSigned()
+	sgnd, err := repo.SignSnapshot(data.DefaultExpires(data.CanonicalSnapshotRole))
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	err = signed.Sign(cryptoService, out, key)
+	sgndJSON, err := json.Marshal(sgnd)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
-	return out, sn.Signed.Version, nil
+	return &storage.MetaUpdate{
+		Role:    data.CanonicalSnapshotRole,
+		Version: repo.Snapshot.Signed.Version,
+		Data:    sgndJSON,
+	}, nil
 }

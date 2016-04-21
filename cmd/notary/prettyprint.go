@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/docker/notary/client"
@@ -95,19 +95,16 @@ func prettyPrintKeys(keyStores []trustmanager.KeyStore, writer io.Writer) {
 	var info []keyInfo
 
 	for _, store := range keyStores {
-		for keyPath, role := range store.ListKeys() {
-			gun := ""
-			if role != data.CanonicalRootRole {
-				gun = filepath.Dir(keyPath)
-			}
+		for keyID, keyIDInfo := range store.ListKeys() {
 			info = append(info, keyInfo{
-				role:     role,
+				role:     keyIDInfo.Role,
 				location: store.Name(),
-				gun:      gun,
-				keyID:    filepath.Base(keyPath),
+				gun:      keyIDInfo.Gun,
+				keyID:    keyID,
 			})
 		}
 	}
+
 	if len(info) == 0 {
 		writer.Write([]byte("No signing keys found.\n"))
 		return
@@ -130,7 +127,7 @@ func prettyPrintKeys(keyStores []trustmanager.KeyStore, writer io.Writer) {
 
 // --- pretty printing targets ---
 
-type targetsSorter []*client.Target
+type targetsSorter []*client.TargetWithRole
 
 func (t targetsSorter) Len() int      { return len(t) }
 func (t targetsSorter) Swap(i, j int) { t[i], t[j] = t[j], t[i] }
@@ -138,9 +135,18 @@ func (t targetsSorter) Less(i, j int) bool {
 	return t[i].Name < t[j].Name
 }
 
-// Given a list of KeyStores in order of listing preference, pretty-prints the
-// root keys and then the signing keys.
-func prettyPrintTargets(ts []*client.Target, writer io.Writer) {
+// --- pretty printing roles ---
+
+type roleSorter []*data.Role
+
+func (r roleSorter) Len() int      { return len(r) }
+func (r roleSorter) Swap(i, j int) { r[i], r[j] = r[j], r[i] }
+func (r roleSorter) Less(i, j int) bool {
+	return r[i].Name < r[j].Name
+}
+
+// Pretty-prints the sorted list of TargetWithRoles.
+func prettyPrintTargets(ts []*client.TargetWithRole, writer io.Writer) {
 	if len(ts) == 0 {
 		writer.Write([]byte("\nNo targets present in this repository.\n\n"))
 		return
@@ -148,16 +154,55 @@ func prettyPrintTargets(ts []*client.Target, writer io.Writer) {
 
 	sort.Stable(targetsSorter(ts))
 
-	table := getTable([]string{"Name", "Digest", "Size (bytes)"}, writer)
+	table := getTable([]string{"Name", "Digest", "Size (bytes)", "Role"}, writer)
 
 	for _, t := range ts {
 		table.Append([]string{
 			t.Name,
 			hex.EncodeToString(t.Hashes["sha256"]),
 			fmt.Sprintf("%d", t.Length),
+			t.Role,
 		})
 	}
 	table.Render()
+}
+
+// Pretty-prints the list of provided Roles
+func prettyPrintRoles(rs []*data.Role, writer io.Writer, roleType string) {
+	if len(rs) == 0 {
+		writer.Write([]byte(fmt.Sprintf("\nNo %s present in this repository.\n\n", roleType)))
+		return
+	}
+
+	// this sorter works for Role types
+	sort.Stable(roleSorter(rs))
+
+	table := getTable([]string{"Role", "Paths", "Key IDs", "Threshold"}, writer)
+
+	for _, r := range rs {
+		table.Append([]string{
+			r.Name,
+			prettyPrintPaths(r.Paths),
+			strings.Join(r.KeyIDs, "\n"),
+			fmt.Sprintf("%v", r.Threshold),
+		})
+	}
+	table.Render()
+}
+
+// Pretty-prints a list of delegation paths, and ensures the empty string is printed as "" in the console
+func prettyPrintPaths(paths []string) string {
+	// sort paths first
+	sort.Strings(paths)
+	prettyPaths := []string{}
+	for _, path := range paths {
+		// manually escape "" and designate that it is all paths with an extra print <all paths>
+		if path == "" {
+			path = "\"\" <all paths>"
+		}
+		prettyPaths = append(prettyPaths, path)
+	}
+	return strings.Join(prettyPaths, "\n")
 }
 
 // --- pretty printing certs ---
